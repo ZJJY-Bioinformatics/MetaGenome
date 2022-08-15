@@ -4,9 +4,11 @@
 # created by wangjiaxuan 2022.7
 
 # 设置工作路径
-mkdir 3.Result_Sum
-mkdir 2.Humann2_Quantity
-mkdir 1.Kneaddata_Clean
+if [ ! -e 0.Input/ ]; then mkdir 0.Input  ;fi
+if [ ! -e 3.Result_Sum ]; then mkdir 3.Result_Sum  ;fi
+if [ ! -e 2.Humann2_Quantity ]; then mkdir 2.Humann2_Quantity  ;fi
+if [ ! -e 1.Kneaddata_Clean ]; then mkdir 1.Kneaddata_Clean  ;fi
+if [ ! -e shell/ ]; then mkdir shell  ;fi
 
 func() {
     echo "Usage:"
@@ -18,9 +20,9 @@ func() {
     exit -1
 }
 
-input="/data/wangjiaxuan/workflow/meta-genome/0.Input/sample_input_path.tsv"
+input="0.Input/sample_input_path.tsv"
 
-while getopts "s:g:c:l:r:h" opt; do
+while getopts "i:s:h" opt; do
     case $opt in
       i) input="$OPTARG";;
       s) step="$OPTARG";;
@@ -29,10 +31,6 @@ while getopts "s:g:c:l:r:h" opt; do
     esac
 done
 
-export PATH="/home/tangwenli/miniconda3/bin:$PATH"
-which conda
-source activate humann2
-export PATH="/home/tangwenli/miniconda3/envs/humann2/bin:$PATH"
 
 # 环境变量
 fastuniq=/data/wangjiaxuan/biosoft/miniconda3/envs/meta/bin/fastuniq
@@ -40,12 +38,21 @@ kneaddata_db=/tools/db/metagenome/KneadData_db/Homo_sapiens_hg37_and_human_conta
 run_mem=506384m
 trimmomatic_p="SLIDINGWINDOW:5:20 MINLEN:36 LEADING:3 TRAILING:3 ILLUMINACLIP:/tools/Trimmomatic-0.38/adapters/TruSeq3-PE.fa:2:30:10"
 # shellcheck disable=SC1073
+
+
 cat ${input} | while read group sample fq1 fq2
 do
+  cat > shell/${sample}_main_run.sh<<EOF
+
+  # 激活conda环境
+  export PATH="/home/tangwenli/miniconda3/bin:\$PATH"
+  source activate humann2
+  export PATH="/home/tangwenli/miniconda3/envs/humann2/bin:\$PATH"
+
   ## PCR Deduplication-----------
-  echo -e "${fq1}\n${fq2}" > fq.list
-  ${fastuniq} -i fq.list -o 0.Input/${sample}.uniq.R1.fq -p 0.Input/${sample}.uniq.R2.fq
-  ## Kneaddata clean fq and remove host contamination
+  echo -e "${fq1}\n${fq2}" > 0.Input/fq.list
+  ${fastuniq} -i 0.Input/fq.list -o 0.Input/${sample}.uniq.R1.fq -p 0.Input/${sample}.uniq.R2.fq
+  # Kneaddata clean fq and remove host contamination
   kneaddata \
   -i 0.Input/${sample}.uniq.R1.fq \
   -i 0.Input/${sample}.uniq.R2.fq \
@@ -70,18 +77,43 @@ do
   --output 2.Humann2_Quantity \
   --search-mode uniref90
 
-
   humann2_renorm_table -i 2.Humann2_Quantity/${sample}_humann2_in4_genefamilies.tsv -o 2.Humann2_Quantity/${sample}_humann2_in4_genefamilies_cpm.tsv --units cpm
+  echo "${sample} have analysis finised!"
+EOF
 done
-rm fq.list
+
+if [ -e 0.Input/fq.list ]; then rm 0.Input/fq.list  ;fi
+
+# 批量运行
+datetime=$(date)
+echo "the workflow run at ${datetime}"
+pid=()
+for script in shell/*_main_run.sh
+  do
+    bash ${script} 2>shell/${sample}.err 1>shell/${sample}.log &
+    pid+=("$!")
+  done
+wait ${pid[@]}
+datetime=$(date)
+echo "the workflow finished at ${datetime}"
+
+# 收集bug list
+/data/wangjiaxuan/biosoft/miniconda3/envs/rnaseq/bin/collect-columns \
+3.Result_Sum/all.sample_buglist.tsv \
+2.Humann2_Quantity/*_temp/*_bugs_list.tsv
+
+
+# rename tabel
 
 /data/wangjiaxuan/biosoft/miniconda3/envs/meta/bin/kneaddata_read_count_table \
 --input 1.Kneaddata_Clean \
 --output 1.Kneaddata_Clean/kneaddata_qc_result.tsv
+
 #
 /data/wangjiaxuan/biosoft/miniconda3/envs/meta/bin/multiqc \
 -d 1.Kneaddata_Clean/fastqc \
 -o 1.Kneaddata_Clean/multiqc_result
+
 #
 humann2_join_tables \
 -i 2.Humann2_Quantity \
@@ -112,3 +144,39 @@ humann2_rename_table \
 --input 3.Result_Sum/all.sample_genefamilies_cpm.tsv \
 --output 3.Result_Sum/all.sample_Functionfamilie_cpms.tsv \
 --names uniref90
+
+humann2_rename_table \
+--input 3.Result_Sum/all.sample_genefamilies_cpm.tsv \
+--output 3.Result_Sum/all.sample_KO_cpms.tsv \
+--names kegg-pathway
+
+humann2_rename_table \
+--input 3.Result_Sum/all.sample_genefamilies_cpm.tsv \
+--output 3.Result_Sum/all.sample_GO_cpms.tsv \
+--names go
+
+humann2_rename_table \
+--input 3.Result_Sum/all.sample_genefamilies_cpm.tsv \
+--output 3.Result_Sum/all.sample_metacyc_cpms.tsv \
+--names metacyc-pwy
+
+mkdir -p 4.Out2CAMP
+
+/data/wangjiaxuan/biosoft/miniconda3/bin/Rscript \
+util/out2cmap.r
+
+
+mkdir -p 5.HostGene_EXP
+
+
+cat ${input} | while read group sample fq1 fq2
+do
+  fq1=$(ls 1.Kneaddata_Clean/${sample}*_contam_1.fastq)
+  fq2=$(ls 1.Kneaddata_Clean/${sample}*_contam_2.fastq)
+  echo -e "${group}\t${sample}\t${fq1}\t${fq2}" >> 5.HostGene_EXP/hostrna_input.tsv
+done
+
+cd  5.HostGene_EXP
+/data/wangjiaxuan/workflow/bulk-rna-seq/run_RNAseq -i hostrna_input.tsv
+
+
